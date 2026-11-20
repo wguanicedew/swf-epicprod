@@ -136,10 +136,24 @@ of not-yet-running work at a queue in hours at the queue's capacity:
   declared rows.
 
 A queue's calibration (median and p90 walltime, p90 start latency) is
-taken from its finished production jobs over 14 days, and counts only
-from 20 of them (`CALIBRATION_MIN_JOBS` in `monitor_app/panda/census.py`).
-Below that the queue reads uncalibrated: one fast trial job gave
-UM_GREX_PanDA_1 a p90 start latency of 0.04 h.
+taken from its finished production jobs over 14 days
+(`monitor_app/panda/census.py`). A quiet spell does not erase it: the
+census keeps a 90-day memory of every queue (`census.memory`, the cached
+product `queue_memory:v1`, rebuilt daily), its ceiling is the most the
+queue ran at once in those 90 days, and a queue with no finished
+production job in 14 days is read at its walltimes over the 90. A queue
+quiet for weeks is therefore regulated from its first cycle as it was
+before the quiet spell (Torre Wenaus, 2026-11-18: "WE NEED A FRONT THAT
+SMOOTHLY RESTARTS AFTER A QUIET PERIOD OF WEEKS"); after two quiet weeks
+the 14-day window alone read OSG's ceiling as 18, where it had run 4,425
+at once in October. A queue with no walltime in either window, a new
+one, has no depth in hours, and that never holds it: it takes the next
+eligible task whenever it has no unstarted production work of its own,
+one a cycle (`front.decide`), as a whole-node queue does. From
+2026-09-30 a 20-job minimum read every queue below it as uncalibrated,
+and the front held such a queue (`no_calibration`); after 18 days in
+which the front fed no queue, it held all of them, and ready tasks sat
+in the buffer (Torre Wenaus, 2026-11-18: "MANIFESTLY UNACCEPTABLE").
 
 Historical concurrency normalizes work depth. A running count below that
 reference does not establish unused available slots and does not hold task
@@ -327,11 +341,11 @@ task cap; `max_per_cycle` and the activation window bound a cycle.
 | State | Condition | Action | Reason |
 |---|---|---|---|
 | supplied | depth ≥ `h_low`, gates green | hold | `supplied` |
-| refill | depth < `h_low`, gates green, feed on, no submission awaiting observation | submit the highest-priority eligible task; at most `max_per_cycle` per cycle, never past `h_high`, never past the caps | `fed:<task>` |
+| refill | depth < `h_low`, gates green, feed on, no submission awaiting observation | submit the highest-priority eligible task; at most `max_per_cycle` per cycle, never past `h_high` (in phase two the first task of a cycle into a queue below `h_low` is fed whatever its hours, JEDI pacing its generation: a large task can read past the mark at a queue with nothing to do; 2026-11-18), never past the caps | `fed:<task>` |
 | awaiting observation | a submission is younger than one activation window (two cycles) | hold; count the submission as committed depth | `awaiting_observation` |
 | degraded | a gate is red: canary failing or its window stale, burn-through or windowed failure rate over threshold, credential invalid | hold; breaker opens | `canary`, `burn_through`, `failure_window`, `credential` |
 | half open | the breaker's cause has cleared and policy allows automatic recovery | submit one task and wait for completions; on failure reopen with a doubled wait | `half_open` |
-| held | queue feed off or exempt, or front off; a declared downtime in force or starting within `h_high` hours (checked right after the breaker, ahead of the measured gates: a declaration is not a fault, the breaker stays closed and the hold lifts itself when the window ends); a feed that would pass `h_high`; the task or job cap; a task that cannot be sized; no calibration for the queue | hold | `queue_off`, `queue_exempt`, `front_off`, `declared`, `would_exceed_high`, `task_cap`, `job_cap`, `unsized_task`, `no_calibration` |
+| held | queue feed off or exempt, or front off; a declared downtime in force or starting within `h_high` hours (checked right after the breaker, ahead of the measured gates: a declaration is not a fault, the breaker stays closed and the hold lifts itself when the window ends); a feed that would pass `h_high`; the task or job cap; a task that cannot be sized | hold | `queue_off`, `queue_exempt`, `front_off`, `declared`, `would_exceed_high`, `task_cap`, `job_cap`, `unsized_task` |
 | oversize | the next eligible task alone exceeds `h_high` (phase one) | hold for the operator's decision | `oversize_task` |
 | no work | nothing in `ready` is eligible for the queue | hold; the page states the starvation | `no_eligible_task` |
 | node occupied | a whole-node queue (Perlmutter, Google: one job per node) whose own work fills its `nodes`: production jobs not started or running, plus files JEDI has not made jobs of, and at least one node for each live task | hold; below it, the next eligible task is fed whatever its hours, one a cycle, ahead of the calibration and depth checks, which measure hours (NERSC_PERLMUTTER.md, EVGEN input in production) | `node_occupied` |
@@ -401,8 +415,7 @@ queue needed work, so all six ready tasks sat under OSG while GREX, its
 feed just switched back on, decided `no_work` at 0 h of its 8 h low mark.
 Now the unplaced tasks form one ready pool, and a queue takes a task from
 it only when it decides to feed, below its low mark. The queues the front
-feeds (feed switch on, and calibrated, since an uncalibrated queue holds
-with `no_calibration`) decide in the recommendation's order with no
+feeds (feed switch on, measured or not) decide in the recommendation's order with no
 task's limits, the neediest first (`draw_order`), with this cycle's feed
 switches. Each draws the pool's tasks open to it by the recommendation's
 own reading (no red gate, a fit to its limits and image; `open_to`),
@@ -542,7 +555,9 @@ A queue is not recommendable when its feed switch is off, when a gate
 is red, or when one job of the task exceeds a limit (walltime, memory
 per job as memory per core times cores, cores). The rest rank in five
 steps:
-1. By canary standing, healthy first.
+1. By canary standing: healthy, and too little evidence to judge (a
+   quiet queue's reading; ranked after healthy until 2026-11-18, a queue
+   idle for weeks drew last), then unknown, then degraded.
 2. By recent failures: a queue whose gate window (six hours) holds at
    least 50 outcomes, 10% or more of them failed, ranks after the cleaner
    queues, well before its failure-window gate (60%) holds it.
@@ -564,7 +579,13 @@ still choose it explicitly, and work a person places there is fed;
 (`front.queue.<queue>.feed_auto_on` = `exit78`, its reason in
 `front.queue.<queue>.feed_off_reason`) comes back on at the start of the first
 front cycle in which the queue has had no exit-78 failure for 90 minutes
-and at least 100 finished jobs over the same window (`swf_epicprod/feed_guard.py`).
+and at least 100 finished jobs over the same window, or in which a canary
+probe submitted after the switch-off has come back healthy, as the canary
+page reads it (site-canary `canary.probe.probe_health`; Torre Wenaus,
+2026-11-18: "a successful canary turns it back on, tht's what they are
+for!"). The probe lands at the site and stages its output out, so it
+proves the path where a drained queue has no production jobs to prove it
+(`swf_epicprod/feed_guard.py`).
 The return clears the reason, and with it the site's feed-off report
 line, records `front` as who switched it and when, and is posted live
 (`feed_auto_on`). GREX's feed was switched off this way on
@@ -690,10 +711,14 @@ a move is automatic: the downside is nil, the upside large. Each front
 cycle (`swf_epicprod/idle_move.py`, after the queue decisions) now moves a
 task from its queue S to a queue T when all of these hold:
 - T is idle: the front found nothing in `ready` for it (`no_work`), it is
-  below its low mark, its feed switch is on and its canary is healthy;
+  below its low mark, its feed switch is on and its canary is neither
+  degraded nor failing. A queue quiet for weeks is idle: its canary has too
+  little evidence to judge and its window holds no outcome, and until
+  2026-11-18 each of those refused it (Torre Wenaus, 2026-11-18: "NONE OF
+  THIS REFUSING TO START");
 - T is not failing: its failed jobs, those a finding explains included, are
-  under 20% of its finished and failed jobs in the front's gate window, and a
-  window with none does not establish it (Torre, 2026-10-26: "NO MOVE UNLESS
+  under 20% of its finished and failed jobs in the front's gate window; a
+  window with none holds no failure (Torre, 2026-10-26: "NO MOVE UNLESS
   FAILURE FRACTION BELOW 20%", after the rule moved task 41349's 500 jobs to
   GREX while 2,696 of its 7,343 jobs in the window had failed, under the
   front's 60% red). The same limit holds over the last hour when it holds 20
@@ -714,7 +739,8 @@ task from its queue S to a queue T when all of these hold:
 - the move leaves T no deeper than S: `T + task at T <= S - task at S`,
   in hours at each queue's capacity (The pressure measure). S may itself
   read `no_work`; the depths give the direction, so the moved work has
-  no reason to come back;
+  no reason to come back. A T with no walltime on record, a new queue,
+  has no depth in hours and takes one task a cycle;
 - the task has had no reassign within the cooldown.
 
 Tasks with no jobs generated go first, since moving one closes nothing;

@@ -42,6 +42,20 @@ def trial_output_root(name):
 # what survives a trial is the acceptance and the record, not the data.
 TRIAL_LIFETIME_DAYS = 14
 
+# The source's overrides that belong to its own run, not to a trial of its
+# configuration (PCS.md § Trials): the Event Service shape, its sample's output
+# namespace and the site feeders' markers, since a trial is one ordinary job
+# under its own name; a site's input-staging record, which names the source's
+# staging job; and where the source was placed, since the trial runs where it
+# is composed for (trial_site); and the source's recorded output datasets
+# (outputs, output_refs), since a trial writes only under its own root.
+# Copied, a trial of an Event Service source could not submit, the source's pin
+# overrode the trial's site, and the trial was listed as a producer of the
+# source's production datasets.
+TRIAL_DROPPED_OVERRIDES = ('event_service', 'production_sample_prefix', 'google_production',
+                           'perlmutter_production', 'site_input', 'panda_site', 'placed_by',
+                           'outputs', 'output_refs')
+
 
 def trials_of(dataset):
     """Every trial dataset of one configuration, oldest number first."""
@@ -133,7 +147,8 @@ def compose_trial(source_task, events=DEFAULT_TRIAL_EVENTS, site='',
         prod_config=prod_config or source_task.prod_config,
         request=source_task.request,
         requestor=source_task.requestor,
-        overrides=dict(source_task.overrides or {}),
+        overrides={key: value for key, value in (source_task.overrides or {}).items()
+                   if key not in TRIAL_DROPPED_OVERRIDES},
         created_by=created_by or 'trial',
     )
     task.save()

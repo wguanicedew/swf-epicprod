@@ -153,8 +153,14 @@ class DecideTest(unittest.TestCase):
         capped = dict(SETTINGS, j_max=1500)
         self.assertEqual(run(census(not_started=1000), [entry('t', rows=1000)], settings=capped,
                              jedi_throttled=True)[0][0], 'would_feed')
+        # An empty queue takes its first task whatever its hours; past the
+        # low mark the high mark holds the next.
         self.assertEqual(run(census(), [entry('huge', rows=13000)], jedi_throttled=True)[0][:2],
-                         ('held', 'would_exceed_high'))
+                         ('would_feed', 'would_feed:huge'))
+        out = run(census(), [entry('t', rows=1000), entry('huge', rows=13000)],
+                  jedi_throttled=True)
+        self.assertEqual([o[:2] for o in out], [('would_feed', 'would_feed:t'),
+                                                ('held', 'would_exceed_high')])
 
     def test_awaiting_observation_counts_the_feed(self):
         feeds = [{'candidate_rows': 2000}]
@@ -173,10 +179,13 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(run(idle, [], last_feed_age_h=1.0)[0][:2],
                          ('no_work', 'no_eligible_task'))
 
-    def test_no_calibration_holds(self):
+    def test_unmeasured_queue_takes_work_when_empty(self):
         bare = {'not_started': 0, 'running': 0, 'ceiling': 0, 'hours_at_capacity': None,
                 'calibration': {}, 'gate': {}}
-        self.assertEqual(run(bare, [entry('t')])[0][:2], ('held', 'no_calibration'))
+        self.assertEqual(run(bare, [entry('t')])[0][:2], ('would_feed', 'would_feed:t'))
+        busy = dict(bare, not_started_production=40)
+        self.assertEqual(run(busy, [entry('t')])[0][:2], ('supplied', 'supplied'))
+        self.assertEqual(run(bare, [])[0][:2], ('no_work', 'no_eligible_task'))
 
     def test_fast_detectors_need_a_minimum_sample(self):
         self.assertFalse(fast_detectors({'finished': 0, 'failed': 5, 'fast_failed': 5})['red'])

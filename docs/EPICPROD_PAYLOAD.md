@@ -27,7 +27,8 @@ EVGEN submission) ships a sandbox holding the manifest, an
 files, the in-job dispatcher `evgen_job_dispatcher.py`, and, since
 stage 0 (2026-09-06), the epicprod payload as `payload/`. The
 dispatcher reads its manifest row and hands it to `payload/run.sh` in
-the sandbox; the container's own copy of the production team's
+the sandbox, with the row's start as `EPICPROD_SKIP_EVENTS` when the row
+carries one (JEDI_INTEGRATION.md § Components); the container's own copy of the production team's
 scripts at `/opt/campaigns/hepmc3/scripts/` is no longer referenced.
 The stages of run.sh, as cloned:
 
@@ -37,7 +38,7 @@ The stages of run.sh, as cloned:
 | Software | sources the detector setup for `DETECTOR_VERSION`; sets `RUCIO_CONFIG` to its own `rucio.cfg`, account `eicprod` | the container |
 | Landing | `landing_check.py`: a TLS handshake with the Rucio server named in `rucio.cfg` and a TCP connect to the input door, each with a short timeout and one retry, the node guard's published exclusion fetched once (this node listed by a live document in force), and the write door when the job's outputs have no other way home (`xrdfs stat`, then the date on the certificate the door serves); a definite negative exits 80 in seconds with the reason in the stage log and the report, an expired write-door certificate exits 86, doubt proceeds | `RUCIO_CONFIG`, `XRDRURL`, `NODE_EXCLUSION_URL`, `LANDING_WRITE_DOOR` |
 | Geometry | resolves the detector compact file for the beams, `<config>_<e>x<p>.xml`, or for the stand-in beams `DETECTOR_BEAMS` names when the image has no geometry for the physics beams; a missing file exits 83 in seconds, before any generation or simulation | the container, `EBEAM`, `PBEAM`, `DETECTOR_BEAMS` |
-| Input | stats a `hepmc3.tree.root` input at the JLab door (`xrdfs stat`, twice; the door's "no such file" exits 85 in seconds, any other answer proceeds) and streams it; copies other inputs with `xrdcp` | `XRDRURL`, `XRDRBASE` |
+| Input | stats a `hepmc3.tree.root` input at the JLab door (`xrdfs stat`, twice; the door's "no such file" exits 85 in seconds, any other answer proceeds) and streams it; copies other inputs (a hand-written steering file) with `xrdcp` into the job scratch and hands npsim the copy (0.25.34; from 0.25.8, 2026-10-25, to 0.25.33 npsim was given the row's relative path and found no file) | `XRDRURL`, `XRDRBASE` |
 | Background | merges signal and background with the merger `BG_MERGER` selects (`SignalBackgroundMerger` by default, TimeFrameBuilder on request) from `BG_FILES`, rate-scaled skips and a seed mixed from the input name, then checks the merged file holds the frames asked for (see Background merging) | the container, staged `BG_FILES` |
 | Simulation | `npsim` under `prmon`, seeded per chunk | the container |
 | Reconstruction | `eicrecon` under `prmon` | the container |
@@ -168,9 +169,12 @@ at the end of reconstruction. The report carries them as `scratch`
 stage's largest, the peak file count and its stage, the sample count),
 which reaches the job's metadata for finished jobs. The job metrics do
 not carry them: the pilot takes at most ten payload metrics in 200
-characters, which the stage trail nearly fills. The native pilot
-samples each job's scratch itself and reports the peaks in the job
-metrics for every job. A `du` that fails or
+characters, which the stage trail nearly fills. The direct pilot
+reads the same scratch log and reports its peaks in the job metrics
+(`scratchPeakMB`, `scratchPeakFiles`) for every job; it starts no process
+of its own to measure the scratch. Until 2026-11-11 it ran a shell loop in
+every job that walked the scratch twice a minute, about 480 processes an
+hour per job. A `du` that fails or
 runs over a minute leaves its line out and never marks a stage. On
 OSG, HTCondor's own peak (`DiskUsage` in the job's terminate event) is
 the cross-check. The peak is what a task's disk request is to be set
@@ -259,6 +263,42 @@ end, under a hard per-job cap, from every site class ePIC runs on.
 
 Two consumers remain to be connected: the task page, and the scout
 gate. The job page reads the report today.
+
+### The job digest
+
+PanDA keeps 500 characters of a job's metrics and drops the rest, and
+the pilot's own keys share them with the digest. With long names a
+GREX job's metrics ran past the limit after the registration field, so
+its payload version, threads and exit code were lost; 3.7% of the jobs
+of 2026-10-27 were at 480 characters or more. One table,
+`swf_epicprod/payload/metric_keys.py`, names every field the payload
+and the direct pilot write, its short name and the long name written
+before, and every reader goes through it, taking the short name first
+and the long one where a job carries that.
+
+Under `EPICPROD_SWITCH_SHORT_METRICS=1` (payload 0.25.35) the digest
+writes the short names (`pStage`, `pStat`, `pTrail`, `pReg`, `pVer`,
+`pThr`, `pExit`, `pSig`, `pSigStage`, `pStalled`) and no longer repeats
+the event count, which is the pilot's own `nEvents`. The direct pilot
+writes its disk readings under short names (`dT`, `ceFree`, `scFree`,
+`scPeakMB` and the rest) and leaves out the pilot directory's readings
+where that directory is on the scratch's filesystem, since they were
+the scratch's twice (GREX runtime `native-grex-shortnames-fabf634`,
+NATIVE_PILOT_CANARY.md). A GREX canary job's metrics went from 489
+characters, cut after `pReg`, to 381 with every field kept (canaries
+42000 and 42002, 2026-11-16).
+
+Under the same switch (payload 0.25.36) the report carries `logs`, the
+size of each stage's full log (`<task>.<program>.log`; the prmon series
+are left out) and their total, and the digest carries the total in MB,
+rounded up, as `pLogMB`. It is the measure behind the Hilog kind of the
+crash catalog (SEGFAULT_DIAGNOSIS.md, Hilog); the pilot's log tarball
+cannot give it, as the pilot keeps the last 1000 lines of each stage.
+Canary task 42003 (2026-11-16) carried `pLogMB=1` in 391 characters,
+its report 238 KB of stage logs for 100 events.
+
+Since payload 0.25.37 the switch is on by default; `=0` turns it off.
+Its one reading is `metric_keys.short_names_on()`.
 
 ## Exit codes
 
@@ -782,6 +822,25 @@ In order, each a committed step on the clone:
     the batch system gave it (The payload report, Cleaning up after each
     job). On by default from payload 0.25.3, after the same canaries;
     `0` turns it off.
+
+## Event Service input offset
+
+`EPICPROD_SWITCH_ES_INPUT_OFFSET=<N>` (payload 0.25.39, off when unset)
+places an Event Service task's events N positions into its input file: a
+unit's skip is N plus its start less one (`resident_unit.input_skip`, which
+gives run.sh its `EPICPROD_SKIP_EVENTS` and the resident simulation its
+`--skipNEvents`). The harness hands the switch to its slots, whose
+containers start clean. A recovery task reads the segment of a file that an earlier
+task left unread (NERSC_PERLMUTTER.md, EVGEN input in production). Its
+ranges, unit names, seeds and record stay in PanDA's terms, numbered from 1.
+A value other than a nonnegative integer fails the unit.
+
+npsim writes each EVGEN event's own number in the source to `EventHeader`.
+A generator can number its events with gaps (pythia6 keeps the numbers of
+the events it generated), so a saved ID equals its position in the file
+only for a source numbered 0, 1, 2 and on. `scripts/es-readback.py
+--source` reads the expected positions (`--input-offset N` for a recovery
+task) in the source and expects those events' numbers.
 
 ## Event Service closes
 

@@ -742,7 +742,22 @@ def decide(queue, census_q, backlog, settings, gates, feeds, *, enabled, mode,
         state = 'fed' if mode == 'active' else 'would_feed'
         return [(state, f"{state}:{candidate['task']}", rec(candidate))]
     if committed_h is None:
-        return [('held', 'no_calibration', rec())]
+        # No measured walltime at this queue (no finished production job in
+        # the census window: an idle queue, or a new one), so its depth has
+        # no hours. That never holds it (Torre Wenaus, 2026-11-18, on the
+        # 20-job minimum that held every queue: "MANIFESTLY UNACCEPTABLE"):
+        # like a whole-node queue it takes the next eligible task whenever
+        # it has no unstarted production work of its own, one a cycle.
+        own = int(q.get('not_started_production') or 0) + ungenerated
+        if own > 0:
+            return [('supplied', 'supplied', rec())]
+        if not eligible:
+            return [('no_work', 'no_eligible_task', rec())]
+        candidate = eligible[0]
+        if t_max and tasks_active + 1 > t_max:
+            return [('held', 'task_cap', rec(candidate))]
+        state = 'fed' if mode == 'active' else 'would_feed'
+        return [(state, f"{state}:{candidate['task']}", rec(candidate))]
     if committed_h >= h_low:
         return [('supplied', 'supplied', rec())]
     if not eligible:
@@ -766,7 +781,13 @@ def decide(queue, census_q, backlog, settings, gates, feeds, *, enabled, mode,
         if not jedi_throttled and candidate_h > h_high:
             out.append(('oversize', 'oversize_task', rec(candidate, candidate_h=candidate_h)))
             continue
-        if committed + candidate_h > h_high:
+        # Phase two: a queue below its low mark takes its first task this
+        # cycle whatever the task's hours, since JEDI paces its generation.
+        # An idle queue's ceiling is read from its idle fortnight (OSG read
+        # 18 on 2026-11-18), which can make a large task read past the high
+        # mark at a queue with nothing to do.
+        first_into_empty = jedi_throttled and not fed and committed < h_low
+        if committed + candidate_h > h_high and not first_into_empty:
             out.append(('held', 'would_exceed_high',
                         rec(candidate, candidate_h=candidate_h,
                             committed_after=round(committed + candidate_h, 2))))
@@ -835,7 +856,11 @@ def hours_summary(backlog, latest, unplaced_queue=None):
 # should go, from what the cycle stored. The Site control on the compose
 # page and the front read the same recommendation.
 
-CANARY_RANK = {'healthy': 0, 'insufficient': 1, 'unknown': 1, 'degraded': 2}
+# A canary with too little evidence to judge is a quiet queue's reading and
+# ranks with healthy: ranked after them, a queue idle for weeks drew last
+# and stayed idle (Torre Wenaus, 2026-11-18: "WE NEED A FRONT THAT SMOOTHLY
+# RESTARTS AFTER A QUIET PERIOD OF WEEKS").
+CANARY_RANK = {'healthy': 0, 'insufficient': 0, 'unknown': 1, 'degraded': 2}
 RANK_FAILURE_SHARE = 0.10          # a queue failing this share of its gate window ranks after cleaner ones
 RANK_FAILURE_MIN_OUTCOMES = 50
 
@@ -1452,13 +1477,12 @@ def run_cycle(*, dry_run=False, created_by='front'):
 
     # Ready tasks hold no queue (CONTINUOUS_PRODUCTION.md, The front's
     # placement): the unplaced ones form one pool, and a queue the front
-    # may feed (switched on and calibrated) draws on it when it decides
-    # to feed, the neediest first. The ranking reads the previous cycle's
-    # stored decisions with this cycle's switches, gates and limits.
+    # may feed (switched on) draws on it when it decides to feed, the
+    # neediest first; a queue with no measured hours draws too (decide).
+    # The ranking reads the previous cycle's stored decisions with this
+    # cycle's switches, gates and limits.
     feedable = [q for q in queues
-                if enabled and settings_by_queue[q].get('feed')
-                and ((census or {}).get('queues', {}).get(q) or {})
-                .get('hours_at_capacity') is not None]
+                if enabled and settings_by_queue[q].get('feed')]
     pool = backlog.pop(UNPLACED, [])
     pool = _safe('lapsed unplace marks', lambda: lapse_unplaced(
         pool, created_by=created_by, dry_run=dry_run), lambda exc: pool)

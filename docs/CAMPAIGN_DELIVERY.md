@@ -125,7 +125,10 @@ target campaign, unattached DIDs and duplicate row copies are counted
 in the build summary, never dropped silently.
 
 The preceding `file_events_measure` step keeps the measurement store
-current (The events source, below). Both steps record their outcome
+current (The events source, below). Its JLab Rucio reads try a dropped
+connection again after one minute and again after five
+(`DROP_RETRY_WAITS`): drops near 03:15 ET failed the step on 2026-11-13
+and 2026-11-14, and it reran clean by hand minutes later. Both steps record their outcome
 in the epicprod action stream, and the `delivery_record_freshness`
 alarm fires when the newest daily snap is older than 30 hours — one
 missed night. At step completion the agent buffers one Capcom notice
@@ -188,7 +191,8 @@ files two submissions named with different chunk sizes, and files with
 no size basis keep their existing row and are reported. Sandbox rows
 replace inferred rows and never a measured one; every measured anchor
 they meet is compared and the disagreements reported. The PanDA server
-keeps sandboxes for about a month, so the pass caches each task's CSV
+keeps sandboxes for ninety days after a task ends (EPICPROD_RETRIES.md),
+so the pass caches each task's CSV
 and environment under `/data/wenauseic/swf-delivery/panda-sandboxes/`
 (the submitter's proxy is never written) and a campaign's older tasks
 are recoverable only while their sandbox lasts. Hand-run through

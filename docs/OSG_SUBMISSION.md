@@ -51,7 +51,7 @@ worker running again. PanDA's heartbeat watcher eventually recovers the
 old job; on 26 October its timeout was two hours and `copyArchive` ran
 every 2,400 seconds. These delays explain some nearly complete task tails.
 
-The native production template prevents ordinary restarts using Condor's
+The direct-pilot production template prevents ordinary restarts using Condor's
 [documented policy](https://research.cs.wisc.edu/htcondor/wiki-archive/pages/HowToAvoidJobRestarts/):
 
 ```text
@@ -131,7 +131,7 @@ handling. These additions have less field exposure than the original cohort.
 The ramp is normal Harvester refill: at most 600 waiting pilots and 300
 new workers per cycle, subject to demand. No worker-limit increase or batch
 removal accompanied the switch. Condor dry-run rendering succeeded and the
-20 native tests passed. First real Harvester submission: `27496.0`, worker
+20 direct-pilot tests passed. First real Harvester submission: `27496.0`, worker
 `2364932`, at 14:38:50 UTC, with the expected image, direct executable,
 transferred assets and `harvester-BNL_osg_harvester_1` scheduler identity.
 PanDA independently confirmed task 41040 running in `27498.2` (job
@@ -217,7 +217,7 @@ policy as the launcher. Existing workers retain their transferred assets.
 The policy and `runtime-policy.py` travel with each pilot as frozen
 input files. Both the production renderer and cohort submitter include
 them. `render-native-production.py --retarget` changes an existing
-native template's asset paths and deployment tag, retaining its image,
+direct-pilot template's asset paths and deployment tag, retaining its image,
 Harvester identity, resource requests, runtime, CPU restrictions and
 node guard. A cohort must explicitly resolve a Harvester runtime
 placeholder with `--runtime-minutes`; it must not silently reuse the
@@ -622,7 +622,7 @@ FSU.
 
 ## Container layering as implemented
 
-The ALRB pilot's layering, 2026-09-01; the native pilot removed steps 2
+The ALRB pilot's layering, 2026-09-01; the direct pilot removed steps 2
 and 3 (Current state, above).
 
 1. The glidein starts the pilot job inside the pool's default image
@@ -687,7 +687,7 @@ Under production operations control now:
   (with the CRIC `workflow` field), the template and wrapper used.
 - The pilot (pilot3, `pilot/user/epic/`). The stand-down in the requested
   image and the independence from ALRB listed here on 2026-09-01 shipped
-  as the native pilot (production 2026-10-23).
+  as the direct pilot (production 2026-10-23).
 - The payload and the submission spec on the production side.
 
 Not under local control: the pool's frontend policy and factory
@@ -744,6 +744,12 @@ place of `{pilotUrlOption}` in the submit description's `arguments`:
   backup `panda_queueconfig.json-backup-2026-10-02`.
   `BNL_OSG_PanDA_1` and `BNL_OSG_PanDA_pilotest` keep the shared
   template and its CRIC-driven pilot URL.
+
+History: this pilot is the obsolete retired pilot. Since 2026-11-17 the
+retired `BNL_OSG_EPIC_PROD_1` names the direct-pilot template of
+`BNL_OSG_PanDA_1` and its launcher; its own template is renamed
+`submit_pilot2_pull_bnl_osg_epicprod.sdf.retired-pilot-20261118T033604Z`
+(distcomp-services `osg-harvester/CHANGES.md`).
 
 Harvester reads the template at every submission and reloads its queue
 configuration within ten minutes, so no service action is needed. A
@@ -906,7 +912,7 @@ the same steps as a tarball.
 ### Excluding what delivers nothing
 
 On 24 October at 14:25:04 UTC, the active pull template and 588 idle
-native pilots gained a temporary exclusion of the single Fir glidein
+direct pilots gained a temporary exclusion of the single Fir glidein
 `glidein_2038143_212390262` on `fc20524.int.fir.alliancecan.ca`.
 Nine workers there were held with code 21, disk usage 4,750,000 KiB
 against a 4,500,000 KiB request; those stopped workers were removed by
@@ -994,8 +1000,9 @@ exclusion keeps the pilots away from it in the first place.
 **The node guard's clause.** Since 2026-10-20 the node guard's black
 holes (site-canary docs/NODE_GUARD.md) are kept off the pool's pilots by
 the same matchmaking, beside the operators' clause and without touching
-it. Both pull descriptions, `submit_pilot2_pull_bnl_osg.sdf` and
-`submit_pilot2_pull_bnl_osg_epicprod.sdf`, end their `Requirements` with
+it. The pull description `submit_pilot2_pull_bnl_osg.sdf`, which both OSG
+queues name since 2026-11-17 (until then also
+`submit_pilot2_pull_bnl_osg_epicprod.sdf`), ends its `Requirements` with
 `&& (MY.EpicprodNodeGuard =!= False)`, and after the marker line
 `# epicprod node guard: osg-node-guard-clause.py writes the next line`
 carry the attribute `+EpicprodNodeGuard`: an expression false on every
@@ -1064,7 +1071,7 @@ The 2026-09-01 plan; all four steps are done.
    the pilot sees (site-canary).
 2. `+SingularityImage = eic_xl` on the submit description together
    with the pilot stand-down, so the glidein's container is the only
-   one. Done with the native pilot, 2026-10-23.
+   one. Done with the direct pilot, 2026-10-23.
 3. With nesting gone, drop the user-namespace requirement; with the
    pilot off ALRB, drop the ATLAS CVMFS requirement. Done in the same
    switch.
@@ -1134,7 +1141,7 @@ passenger slots. The OSPool frontend provisions glideins for a flocked
 schedd's idle jobs only when it can match their requirements to its entries;
 on 22 October `HAS_CVMFS_atlas_cern_ch` and the user-namespace requirement
 could not be matched, and both existed only for the ALRB-nested pilot. The
-native pilot that passed its canaries on SU-ITS and GREX on 22 October needs
+direct pilot that passed its canaries on SU-ITS and GREX on 22 October needs
 neither (plan steps 2 and 3 above). Its trial on the active queue began on 23
 October and it became the queue's production pilot at 10:38 ET that day
 (first section; [NATIVE_PILOT_CANARY.md](NATIVE_PILOT_CANARY.md)), which
@@ -1187,3 +1194,16 @@ XRootD modules; payload/copytool requirements still need an actual canary.
 IPv4 BNL Rucio and JLab Rucio returned HTTP 200; PanDA TCP 25443 timed out
 and TCP 443 refused the connection. IPv6 was unusable. Locating the
 25443 block and proving a complete canary remain part of commissioning.
+
+## JLab on the direct pilot, 17 November 2026
+
+JLab opened the farm's route to `pandaserver01:25443` (Kathryn Strosahl,
+17 November). The queue, offline in Harvester since 22 October, was set
+online at 21:52 ET; the landing probe's job 6608533 was taken by a JLab
+pilot at 22:03 ET, so the route is open. The job then failed in one
+second: `jlab-native-pilot.sh` above runs the obsolete retired pilot
+through the standard wrapper, and that pilot's container setup requires
+`/cvmfs/atlas.cern.ch` (pilot error 1186). The launcher is retired. Since
+22:28 ET JLab's template is GREX's direct-pilot runtime with one pilot per
+batch job, rendered by `scripts/render-native-jlab.py` from the two live
+templates (distcomp-services `harvester/CHANGES.md`).

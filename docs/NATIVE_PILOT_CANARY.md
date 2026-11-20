@@ -1,4 +1,4 @@
-# Native ePIC pilot and single-container canary — 22 October 2026
+# Direct ePIC pilot and single-container canary — 22 October 2026
 
 **Production update, 23 October:** Torre authorized promotion after the
 20-pilot trial. New `BNL_OSG_PanDA_1` Harvester submissions switched to the
@@ -30,11 +30,11 @@ reason to keep the standard rollout on the older bootstrap.
 
 | Site | Deployment status |
 | --- | --- |
-| OSG | Native production launcher, archive `092ac705`, both 26.07.1 and 26.07.3; completed and registered jobs on both images. |
-| GREX | Standard production template switched to the native launcher at 17:33:09 UTC. Archive `9532f30b` retains GREX's epic5 operational fixes. All current queued/running jobs use 26.07.3. First Harvester production submission from this template is still to be observed. |
+| OSG | Direct-pilot production launcher, archive `092ac705`, both 26.07.1 and 26.07.3; completed and registered jobs on both images. |
+| GREX | Standard production template switched to the direct-pilot launcher at 17:33:09 UTC. Archive `9532f30b` retains GREX's epic5 operational fixes. All current queued/running jobs use 26.07.3. First Harvester production submission from this template is still to be observed. |
 | Perlmutter | Off for allocation usage; the existing site launcher still uses the ALRB Python setup. Standard native migration is not deployed. |
-| Google | Off by operator instruction; no native production rollout verified. |
-| JLab | Commissioning, no running workers; the host-Python bootstrap is not the campaign-image native launcher. |
+| Google | Off by operator instruction; no direct-pilot production rollout verified. |
+| JLab | Production since 2026-11-18 (QUEUE_REGISTRY.md). Since 2026-11-17, GREX's direct-pilot runtime with one pilot per batch job (OSG_SUBMISSION.md, JLab on the direct pilot); the earlier host-Python bootstrap ran the obsolete retired pilot. |
 | Compute Canada | Queue not built, awaiting CE authorization ([COMPUTE_CANADA.md](COMPUTE_CANADA.md)). |
 
 GREX's live template is
@@ -256,7 +256,7 @@ monitoring, or log delivery merely because inherited names mention ATLAS.
 
 ## Staged trial on the active OSG queue, 23 October
 
-Torre's order (01:08 ET): run the native pilot on `BNL_OSG_PanDA_1` for
+Torre's order (01:08 ET): run the direct pilot on `BNL_OSG_PanDA_1` for
 experience to evaluate in the morning, by the staged sequence swf-3
 recommended and he confirmed. Stages, each only after the previous one is
 clean: (1) one pilot in `eic_xl:26.07.1-stable`, the image of every task
@@ -448,11 +448,11 @@ build now casts it; the upstream pilot bug is to be reported.
   hold code 45), the only such hold tonight among every pilot we run; the
   same site's scigrid5 runs proc 17; production pilots carry no image at that
   layer and ran on scigrid7 at 04:27 ET. It stays held as evidence: no
-  release, no retry, no site exclusion. Four native jobs have finished
+  release, no retry, no site exclusion. Four direct-pilot jobs have finished
   tonight, each with 1,132 events and zero error codes: 5816241 (26834,
   CNAF), 5816250 and 5816534 (26835 at Fir, nesting the other image, two
-  jobs in one pilot), 5816423 (26893 at GREX). Native pilots held 26 running
-  jobs at 04:55 ET. The jobs of a native pilot are found in the PanDA
+  jobs in one pilot), 5816423 (26893 at GREX). Direct pilots held 26 running
+  jobs at 04:55 ET. The jobs of a direct pilot are found in the PanDA
   database by a `pilotid` carrying `native-20261023`, the cohort's log path.
 - 05:09 ET: the first direct-mode job, 5816380 of pilot 26875 at CNAF, the
   mode the twenty run (no user namespaces, no ATLAS or OASIS repositories
@@ -465,7 +465,7 @@ build now casts it; the upstream pilot bug is to be reported.
   with its hold recorded above (code 45, subcode -1000, slot1_4 of glidein
   2883416 on scigrid7.physics.fsu.edu): a hand-submitted pilot, not a
   harvester worker, whose hold raised the platform's held-workers alarm.
-  Native jobs finished tonight: seven, each 1,132 events, zero errors.
+  Direct-pilot jobs finished tonight: seven, each 1,132 events, zero errors.
 - 06:36 ET: five cohort completions (OU one, Rhodes two, UNL-PATH two), no
   payload failure. The first cohort pilot to leave, 26957.3 at UNL-PATH,
   left by design: its job ended 123 minutes after the pilot started, past
@@ -475,7 +475,7 @@ build now casts it; the upstream pilot bug is to be reported.
   the pilot-side node guard at work on a real worker: the launcher's landing
   check ("not excluded, 5 nodes listed, live mode") and the pilot's own
   check before the next job ("this node is not excluded; next job allowed").
-- 07:14 ET: eighteen native jobs finished tonight, every one with 1,132
+- 07:14 ET: eighteen direct-pilot jobs finished tonight, every one with 1,132
   events and zero error codes, none failed: nine from the cohort (UNL-PATH
   four, Rhodes two, OU, UWM and one more), the site probes at UNL-PATH
   (5816629) and IRISHEP-SSL-UCHICAGO (5816636), and the earlier pilots'
@@ -504,7 +504,7 @@ build now casts it; the upstream pilot bug is to be reported.
 
 ## GREX production image dispatch
 
-GREX uses a campaign image to bootstrap the native pilot, then selects the
+GREX uses a campaign image to bootstrap the direct pilot, then selects the
 payload image per job. Its template sets `EPICPROD_NATIVE_DISPATCH=per-job`
 and enables payload container launching; it does not send a bootstrap-image
 filter to PanDA. OSG remains bound to its glidein image and serves multiple
@@ -589,11 +589,121 @@ cancels or requeues workers and preserves their submit/eligible times.
 Running sandboxes and unknown runtime hashes are excluded. In-place
 queued repair is distinct from proof that a repaired worker has started.
 
+### Scratch peaks without a sampler, 11 November
+
+Until 11 November the native container wrapper ran a shell loop in every job
+that walked the job's scratch twice a minute (`sleep 60`, two `du` through
+pipes and subshells, an `mv`): about 480 processes an hour per job, some
+80,000 an hour on a GREX node of 168 of our jobs. The payload already
+measures its scratch at every stage start and end, and its files only grow
+until the closeout, so those readings hold the peak. The wrapper now starts no
+process to measure it: `scratch_peak` reads the payload's report in
+`jobReport.json` once the payload has ended (runGen removes `workDir`, and the
+scratch log with it, before the pilot's final metrics) and the live
+`payload-scratch.log` while it runs. The job metrics keep the names
+`scratchPeakMB` and `scratchPeakFiles`. OSG's live archive (`092ac705`)
+predates the sampler and is unchanged.
+
+GREX's template moved to `native-grex-nosampler-a70e9dd` at 21:01 UTC
+(`scripts/retarget-native-grex.py`; archive
+`f4efcad873e9c5a904db8c8e34f48fd0fa9b858190bf2ee152d32af29e0e96bf`, which
+differs from the previous `7f3c6805` archive only in `native_container.py`
+and a comment in `jobmetrics.py`; every launcher and helper is byte-identical).
+Template SHA-256
+`7bb61e69a9e08fc9ae3e765530846324b9f100e36bd8d1aedb4a95755c7c0302`; the
+previous ones are kept beside it as
+`submit_pilot3_pull_umgrex.sdf.before-nosampler-20261111T202740Z` (the
+headroom runtime) and `...before-nosampler-a70e9dd-20261111T210102Z`. An
+interim runtime, `native-grex-nosampler-4ee6366`, read only the scratch log:
+its payload canary, task 41841 / job 6608217, finished 2,000 events with its
+output registered but no final peak, which is how runGen's removal of
+`workDir` was found. The validating payload canary is job 6608218 (cluster
+29575, runtime `a70e9dd`): 2,000 events, output registered, pilot error zero,
+heartbeats carrying the peak as it grew (3, 111 MB) and the final record
+`scratchPeakMB=351 scratchPeakFiles=221`, the payload report's own 358,584 KB
+and 221 files.
+
+### Short metric names, 16 November
+
+The archive now writes its disk readings and scratch peaks under the short
+names of `swf_epicprod/payload/metric_keys.py`, which `build.py` ships into
+the pilot as `pilot/user/epic/metric_keys.py`, and leaves out the pilot
+directory's readings when that directory is on the scratch's filesystem
+(EPICPROD_PAYLOAD.md, The job digest). The readings had taken about 330 of
+PanDA's 500 characters of job metrics, so the payload digest behind them was
+cut after its registration field.
+
+GREX's template moved to `native-grex-shortnames-fabf634` at 01:58 UTC on 17
+November (20:58 ET on 16 November; `scripts/retarget-native-grex.py`, label
+`shortnames`). Its archive
+`aad45ad9318fa29caeb6e476fe5edbd80f24057913c3fd3a8045e904b2d55f71` differs
+from the previous `f4efcad8` only in `jobmetrics.py`, `native_container.py`
+and the added `metric_keys.py`; every launcher and helper is byte-identical.
+Template SHA-256
+`167caf23e1b698ed2f316961c729003395b54e3fbb510bd0e26ac0f83b4f91d9`; the
+previous one is kept beside it as
+`submit_pilot3_pull_umgrex.sdf.before-shortnames-20261117T015813Z`.
+
+The validating payload canary, task 42002 / job 6608500 with
+`EPICPROD_SWITCH_SHORT_METRICS=1`, was sent once the last allocation of the
+previous runtime had ended, and ran on n388: healthy, 100 of 100 events, output
+registered, and final metrics of 381 characters with the short disk names, no
+pilot-directory readings and the digest whole through `pExit`. The same task's
+canary on the previous runtime, task 42000 / job 6608498, had 489 characters,
+cut after `pReg`.
+
+### The memory monitor's payload search, 18 November
+
+A payload that ends within a fraction of a second held its pilot for ten
+minutes on GREX and JLab, and not on OSG (Hello World test jobs of 18
+November; JLab job 6609543 started its payload at 14:26:48 ET and saw it
+finish at 14:37:32 ET). After starting the payload, the pilot looks for
+the payload's process to hand to the memory monitor (`get_proper_pid` in
+the ePIC plugin's `utilities.py`): up to 120 tries five seconds apart,
+stopping early only when the process it started has ended. The pilot reaps
+that process only after the search returns, so a payload that has already
+exited stays a zombie, which `os.kill(pid, 0)` still reports as running,
+and the search runs its full ten minutes. On OSG the pilot runs in its
+glidein's own container and sees a handful of processes, so the first
+try, about a millisecond long, finds the payload still running. On GREX
+and JLab the pilot sees the whole node's process table, and the first try
+takes a quarter of a second. A payload that runs longer is found at once
+(GREX job 6609571, a 60-second sleep, took 70 seconds). Production
+payloads are never this short; one that fails at once on GREX or JLab
+held its slot ten minutes before its failure was reported.
+
+`build.py` makes two changes. A payload the wrapper runs in place is the
+process the pilot started; the started and found process ids agreed in
+every job read (36358 and 52238 at JLab, 132 at OSG). So `common.py`
+hands that process to the memory monitor without a search
+(`native_container.ran_in_place`). A payload launched nested in another
+image keeps the search, which now counts an exited, unreaped process as
+finished (`_payload_running` in `utilities.py`), so it ends within one
+five-second wait.
+
+GREX's template moved to `native-grex-pidsearch-e2ee25c` at 22:07:49 ET on
+18 November (`scripts/retarget-native-grex.py`, label `pidsearch`), and
+JLab's was re-rendered from it at 22:08:08 ET (`scripts/render-native-jlab.py
+--max-memory 6000`). The archive
+`61fb982a7855c806592e49bf86e4288177d16f2716f85b37483a0c2e3378a7c3` differs
+from the previous `aad45ad9` only in `utilities.py`, `common.py`,
+`native_container.py` and a helper in `metric_keys.py` that the pilot does
+not call; every launcher and helper is byte-identical. Template SHA-256s:
+GREX `eeaa0f0ea78affc18d0952fa426145a965166fc9c43948c80525b87a8960214a`,
+JLab `75fd227c4cccfccc20880f4697cbcf97aaefeb727180cebe71ce735dda504f83`;
+the previous ones are kept beside them as `...before-pidsearch-20261119T030749Z`
+and `...before-pidsearch-20261119T030808Z` (distcomp-services
+`harvester/CHANGES.md`). On new-runtime pilots the instant-payload probe of
+site-canary (`spec-instant.json`) finished in 7 seconds on GREX (job
+6609580, payload phase 0 seconds against 644 before) and 6 seconds on JLab
+(job 6609581), and the payload canaries 6609578 (GREX) and 6609579 (JLab)
+finished with their 100 events.
+
 ### Shared spool exhaustion, 25–26 October
 
 The GREX CE spool is one 196 GiB NFS filesystem, `/var/lib/condor-ce`,
 shared by every GREX CE user and mounted on the batch workers. From the
-native-pilot rollout of 24 October until 79ec244, the multipilot launcher
+direct-pilot rollout of 24 October until 79ec244, the multipilot launcher
 ran each allocation's eight pilots, and every job directory, in the CE
 sandbox on that spool. The spool filled at 18:50 ET on 25 October and
 again at 01:49 ET on 26 October; the second fill aborted 220 jobs with
@@ -662,7 +772,7 @@ It was built with `perlmutter/build-es-channel.sh` in the 26.07.3 campaign
 image; import and a yampl socket also passed with Python 3.13.12 in the
 26.07.1 reference image. These local checks do not establish worker success.
 
-`EPICPROD_ES_CHANNEL` names this directory for a native pilot. The launcher
+`EPICPROD_ES_CHANNEL` names this directory for a direct pilot. The launcher
 prepends its `python` directory after entering the campaign image, whose
 startup resets `PYTHONPATH`. The pilot and its payload inherit that path.
 Without the setting, the launcher's environment is unchanged.
@@ -681,7 +791,7 @@ in units of five using the existing Upsilon reference input and the
 26.07.1 image. Its private directory is
 `/data/atlpan/native-grex-es-yampl313-20261024`; its frozen assets are
 `/data/atlpan/harvester_common/native-grex-es-yampl313-20261024`, using the
-unchanged native pilot archive
+unchanged direct-pilot archive
 `9532f30b41a8b1c8cfcb730eb325933c71c486454ed4365cd3e2d8b625a27ae2`.
 The trial does not establish channel success: GREX's queue generates a
 SCORE job despite the task requesting two cores. Ordinary pilot 27109.7

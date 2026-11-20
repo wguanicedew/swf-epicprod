@@ -56,6 +56,10 @@ def build(baseline, expected_sha256, output, production=False, heartbeat_seconds
 
     write('pilot/user/epic/native_container.py',
           Path(__file__).with_name('native_container.py').read_text())
+    # The job metric names, one table for every writer and reader.
+    write('pilot/user/epic/metric_keys.py',
+          (Path(__file__).resolve().parents[2] / 'swf_epicprod' / 'payload'
+           / 'metric_keys.py').read_text())
     relative = 'pilot/user/epic/container.py'
     content = (tree / relative).read_text()
     start = content.index('def wrapper(')
@@ -113,7 +117,43 @@ def build(baseline, expected_sha256, output, production=False, heartbeat_seconds
     original = "        setup = get_asetup(asetup=False)\n        setup += 'lsetup prmon;'"
     if content.count(original) != 1:
         raise ValueError('Unexpected memory-monitor baseline')
-    write(relative, content.replace(original, "        setup = 'command -v prmon >/dev/null || exit 69;'"))
+    content = content.replace(original, "        setup = 'command -v prmon >/dev/null || exit 69;'")
+
+    # The memory monitor's payload search ends when the payload has ended
+    # (NATIVE_PILOT_CANARY.md, The memory monitor's payload search). The
+    # pilot reaps the payload only after the search returns, so an exited
+    # payload is a zombie meanwhile, which os.kill(pid, 0) reports as
+    # running: a payload that ended before the first try held the pilot for
+    # the search's whole ten minutes on GREX and JLab.
+    original = 'if not is_process_running(pid):'
+    if content.count(original) != 2 or content.count('\ndef get_proper_pid(') != 1:
+        raise ValueError('Unexpected payload-search baseline in utilities.py')
+    content = content.replace(original, 'if not _payload_running(pid):')
+    content = content.replace('\ndef get_proper_pid(', '''
+def _payload_running(pid: int) -> bool:
+    """ePIC: an exited payload is finished, reaped or not."""
+    try:
+        with open(f'/proc/{pid}/stat', encoding='utf-8') as stat:
+            state = stat.read().rsplit(')', 1)[1].split()[0]
+    except (OSError, IndexError):
+        return is_process_running(pid)
+    return state not in ('Z', 'X')
+
+
+def get_proper_pid(''')
+    write(relative, content)
+
+    # A payload run in place is the process the pilot started: the memory
+    # monitor takes it without a search (same section).
+    relative = 'pilot/user/epic/common.py'
+    content = (tree / relative).read_text()
+    original = "        use_container = job.usecontainer or 'runcontainer' in job.transformation\n"
+    if content.count(original) != 1:
+        raise ValueError('Unexpected memory-monitor container baseline in common.py')
+    write(relative, content.replace(original, original + '''        from pilot.user.epic.native_container import ran_in_place
+        if ran_in_place(job):
+            use_container = False
+'''))
 
     # The bound task from the PanDA_TaskID environment reaches the server as
     # an int: the baseline sends the string and the server's typed API
@@ -173,8 +213,8 @@ except ValueError:
         _file['force_scheme'] = log_scheme
 '''))
 
-    # The job metrics (EPICPROD_PAYLOAD.md, Scratch disk): the scratch peaks the
-    # container wrapper samples for every job, and the payload's declared
+    # The job metrics (EPICPROD_PAYLOAD.md, Scratch disk): the scratch peaks of
+    # the payload's own stage readings, and the payload's declared
     # metrics without the count and length limits the epic5 plugin set itself
     # (Torre Wenaus, 2026-10-24: "i do not like arbitrary limits"). PanDA's own
     # bound, the 500-character jobmetrics column, is the pilot's whole-string
@@ -221,14 +261,15 @@ def patch_job_metrics(content):
             break
 """, ""),
         ("""    # is there a detected rucio trace service error?
-""", """    # ePIC: the job's scratch peaks, sampled by the native container wrapper
+""", """    # ePIC: the job's scratch peaks, from the payload's own stage readings
     from pilot.user.epic.native_container import scratch_peak, disk_headroom
+    from pilot.user.epic import metric_keys
     for name, value in disk_headroom(job.workdir).items():
         job_metrics += get_job_metrics_entry(name, value)
     peak = scratch_peak(job.workdir)
     if peak:
-        job_metrics += get_job_metrics_entry("scratchPeakMB", (peak[0] + 1023) // 1024)
-        job_metrics += get_job_metrics_entry("scratchPeakFiles", peak[1])
+        job_metrics += get_job_metrics_entry(metric_keys.name("scratch_peak_mb"), (peak[0] + 1023) // 1024)
+        job_metrics += get_job_metrics_entry(metric_keys.name("scratch_peak_files"), peak[1])
 
     # is there a detected rucio trace service error?
 """),
