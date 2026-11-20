@@ -279,27 +279,66 @@ def prepare_direct(task, *, by, reason, ignore_placement):
     return attempt
 
 
-def run_doer(task, attempt, *, owner, timeout, log, jlab_proxy='', login_proxy='',
-             tmp_dir=''):
+# The doer's settings an operator outside the production-ops account points
+# elsewhere: option -> (what it is, how the doer takes it).
+DOER_PATHS = {
+    'jlab_proxy': 'the JLab eicprod x509 proxy shipped in the sandbox (--proxy, '
+                  'EVGEN_X509_PROXY)',
+    'login_proxy': 'the robot proxy (longproxy-for-rucio) that signs in to the PanDA server '
+                   'for the JLab Rucio tokens (EPICPROD_PANDA_LOGIN_PROXY, X509_USER_PROXY)',
+    'tmp_dir': 'the scratch root the sandbox is assembled under (SWF_TMP_DIR)',
+    'pclient_setup': 'the panda-client setup the submission kernel sources, holding the '
+                     'cached OIDC token (--pclient-setup, default ~/pclient/run/setup.sh)',
+    'reporting_env': "the job report's S3 settings (JOB_REPORTING_ENV, default "
+                     '~/.epic-job-reporter.env)',
+}
+
+
+def doer_options(args):
+    """The DOER_PATHS options given, as absolute paths."""
+    return {k: os.path.abspath(os.path.expanduser(getattr(args, k)))
+            for k in DOER_PATHS if getattr(args, k, '')}
+
+
+def doer_problem(doer):
+    """Why the doer options cannot work, or ''; read before an attempt is
+    allocated, so a refusal leaves nothing to clean up."""
+    for key in ('jlab_proxy', 'login_proxy', 'pclient_setup', 'reporting_env'):
+        path = doer.get(key)
+        if path and not os.access(path, os.R_OK):
+            return f'--{key.replace("_", "-")} {path} is not readable'
+    tmp = doer.get('tmp_dir')
+    if tmp:
+        root = Path(tmp, 'submit-evgen')
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return f'--tmp-dir {tmp}: {e.strerror}'
+        if not os.access(root, os.W_OK | os.X_OK):
+            return f'--tmp-dir {root} is not writable'
+    return ''
+
+
+def run_doer(task, attempt, *, owner, timeout, log, doer=None):
     """Run the deployed submit-evgen-task.py for the allocated attempt.
     Returns (exit code, jediTaskID or None). The doer records the outcome.
-    ``jlab_proxy`` replaces production.env's EVGEN_X509_PROXY: the JLab x509
-    proxy shipped in the sandbox for the payload's output registration.
-    ``login_proxy`` replaces production.env's X509_USER_PROXY: the robot
-    proxy (longproxy-for-rucio) that signs in to the PanDA server for the
-    tokens the doer reaches JLab Rucio with (swf_epicprod/jlab_auth.py).
-    ``tmp_dir`` replaces SWF_TMP_DIR: the root the doer assembles its
-    sandbox under (``<tmp_dir>/submit-evgen/``)."""
+    ``doer`` replaces production.env's settings (DOER_PATHS)."""
+    doer = doer or {}
     cmd = [str(DEPLOYED / '.venv/bin/python'), str(DEPLOYED / 'scripts/submit-evgen-task.py'),
            '--task-name', task.name, '--panda-tasks-id', str(attempt.pk), '--owner', owner]
     env = doer_environment(owner)
-    if jlab_proxy:
-        cmd += ['--proxy', jlab_proxy]
-        env['EVGEN_X509_PROXY'] = jlab_proxy
-    if login_proxy:
-        env.update(EPICPROD_PANDA_LOGIN_PROXY=login_proxy, X509_USER_PROXY=login_proxy)
-    if tmp_dir:
-        env['SWF_TMP_DIR'] = tmp_dir
+    if doer.get('jlab_proxy'):
+        cmd += ['--proxy', doer['jlab_proxy']]
+        env['EVGEN_X509_PROXY'] = doer['jlab_proxy']
+    if doer.get('login_proxy'):
+        env.update(EPICPROD_PANDA_LOGIN_PROXY=doer['login_proxy'],
+                   X509_USER_PROXY=doer['login_proxy'])
+    if doer.get('tmp_dir'):
+        env['SWF_TMP_DIR'] = doer['tmp_dir']
+    if doer.get('pclient_setup'):
+        cmd += ['--pclient-setup', doer['pclient_setup']]
+    if doer.get('reporting_env'):
+        env['JOB_REPORTING_ENV'] = doer['reporting_env']
     log.parent.mkdir(parents=True, exist_ok=True)
     try:
         p = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=timeout)
@@ -313,21 +352,14 @@ def run_doer(task, attempt, *, owner, timeout, log, jlab_proxy='', login_proxy='
 
 
 def submit_direct(task, *, by, reason, ignore_placement=False, timeout=360, log=None,
-                  jlab_proxy='', login_proxy='', tmp_dir=''):
+                  doer=None):
     """Submit ``task`` to PanDA from this process (no prod-ops agent).
     Returns what happened, for the plan's ``submitted``."""
     from pcs.services import ServiceError
-    # Checked before an attempt is allocated: nothing to clean up.
-    for flag, path in (('--jlab-proxy', jlab_proxy), ('--login-proxy', login_proxy)):
-        if path and not os.access(path, os.R_OK):
-            return {'outcome': 'refused', 'reason': f'{flag} {path} is not readable'}
-    if tmp_dir:
-        try:
-            Path(tmp_dir, 'submit-evgen').mkdir(parents=True, exist_ok=True)
-        except OSError as e:
-            return {'outcome': 'refused', 'reason': f'--tmp-dir {tmp_dir}: {e.strerror}'}
-        if not os.access(Path(tmp_dir, 'submit-evgen'), os.W_OK | os.X_OK):
-            return {'outcome': 'refused', 'reason': f'--tmp-dir {tmp_dir}/submit-evgen is not writable'}
+    doer = doer or {}
+    problem = doer_problem(doer)
+    if problem:
+        return {'outcome': 'refused', 'reason': problem}
     try:
         attempt = prepare_direct(task, by=by, reason=reason, ignore_placement=ignore_placement)
     except ServiceError as e:
@@ -339,8 +371,7 @@ def submit_direct(task, *, by, reason, ignore_placement=False, timeout=360, log=
     log = log or LOG_DIR / f'{task.composed_name}.{stamp}.log'
     owner = task.created_by or by
     try:
-        rc, jedi = run_doer(task, attempt, owner=owner, timeout=timeout, log=log,
-                            jlab_proxy=jlab_proxy, login_proxy=login_proxy, tmp_dir=tmp_dir)
+        rc, jedi = run_doer(task, attempt, owner=owner, timeout=timeout, log=log, doer=doer)
     except (OSError, SystemExit) as e:
         attempt.delete()  # nothing reached PanDA: free the attempt name
         return {'outcome': 'not run', 'reason': str(e), 'panda_task_name': attempt.task_name}
@@ -413,10 +444,7 @@ def restore(args):
     if args.submit_direct:
         result['submitted'] = submit_direct(task, by=args.by, reason=args.reason,
                                             ignore_placement=args.ignore_placement,
-                                            timeout=args.submit_timeout,
-                                            jlab_proxy=args.jlab_proxy,
-                                            login_proxy=args.login_proxy,
-                                            tmp_dir=os.path.expanduser(args.tmp_dir))
+                                            timeout=args.submit_timeout, doer=doer_options(args))
     print(json.dumps(result, indent=2, default=str))
     return 0 if not args.submit_direct or result['submitted'].get('exit') == 0 else 1
 
@@ -426,9 +454,7 @@ def submit_existing(args):
     task = clone_of(args.source)
     result = submit_direct(task, by=args.by, reason=args.reason,
                            ignore_placement=args.ignore_placement, timeout=args.submit_timeout,
-                                            jlab_proxy=args.jlab_proxy,
-                                            login_proxy=args.login_proxy,
-                                            tmp_dir=os.path.expanduser(args.tmp_dir))
+                           doer=doer_options(args))
     print(json.dumps({'task': task.composed_name, 'site': (task.overrides or {}).get('panda_site'),
                       'submitted': result}, indent=2, default=str))
     return 0 if result.get('exit') == 0 else 1
@@ -463,16 +489,10 @@ def main():
     ap.add_argument('--ignore-placement', action='store_true',
                     help='with --submit-direct: submit despite the Event Service placement '
                          'verdict (recorded on the attempt)')
-    ap.add_argument('--jlab-proxy', default='', metavar='PATH',
-                    help='with --submit-direct: the JLab x509 proxy the doer ships for output '
-                         'registration, in place of production.env EVGEN_X509_PROXY')
-    ap.add_argument('--login-proxy', default='', metavar='PATH',
-                    help='with --submit-direct: the robot proxy (longproxy-for-rucio) the doer '
-                         'signs in to the PanDA server with for its JLab Rucio tokens, in '
-                         'place of production.env X509_USER_PROXY')
-    ap.add_argument('--tmp-dir', default='', metavar='PATH',
-                    help='with --submit-direct: scratch root the doer assembles the sandbox '
-                         'under (<PATH>/submit-evgen/), in place of SWF_TMP_DIR=/data/swf-tmp')
+    for key, what in DOER_PATHS.items():
+        ap.add_argument('--' + key.replace('_', '-'), default='', metavar='PATH',
+                        help=f'with --submit-direct: {what}, in place of production.env\'s '
+                             'or the production-ops account\'s')
     ap.add_argument('--submit-timeout', type=int, default=360,
                     help='seconds the direct doer may take (default 360)')
     ap.add_argument('--restore', action='store_true',
@@ -577,10 +597,7 @@ def main():
     elif args.submit_direct:
         plan['submitted'] = submit_direct(task, by=args.by, reason=args.reason,
                                           ignore_placement=args.ignore_placement,
-                                          timeout=args.submit_timeout,
-                                            jlab_proxy=args.jlab_proxy,
-                                            login_proxy=args.login_proxy,
-                                            tmp_dir=os.path.expanduser(args.tmp_dir))
+                                          timeout=args.submit_timeout, doer=doer_options(args))
     print(json.dumps(plan, indent=2, default=str))
     if verdict and not (args.submit_direct and args.ignore_placement):
         print(f'NOT SUBMITTABLE as composed: {verdict}', file=sys.stderr)
