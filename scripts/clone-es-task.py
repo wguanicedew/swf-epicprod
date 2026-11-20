@@ -63,6 +63,13 @@ settings production.env holds. Values are never printed, only key counts.
     clone-es-task.py <clone> --by wguan --reason TEXT --submit-direct
     clone-es-task.py <clone> --by wguan --reason TEXT --restore [--events-per-job N] \\
         [--site QUEUE] [--submit-direct [--ignore-placement]]
+    clone-es-task.py <clone> --by wguan --reason TEXT --production-env \\
+        --fail-pending [TRY ...] [--min-age MINUTES] [--apply]
+
+--fail-pending marks the clone's attempts that show pending (no jediTaskID,
+no recorded failure) as submit_failed: those older than --min-age whose name
+PanDA does not hold, checked by the same jedi_tasks lookup that allocates
+names (so it needs the PANDA_DB_* settings, --production-env).
 """
 import argparse
 import datetime
@@ -379,6 +386,16 @@ def submit_direct(task, *, by, reason, ignore_placement=False, timeout=360, log=
                7: 'submitted, NOT recorded: re-record the jediTaskID (record-submission)',
                8: 'output datasets not created; nothing submitted'}.get(
                    rc, 'failed (the doer recorded the failure on the attempt)')
+    if rc not in (0, 7):
+        # The doer records a failure through the monitor API, and an early
+        # exit or an unwritable record leaves the attempt showing pending.
+        attempt.refresh_from_db()
+        if attempt.jedi_task_id is None and attempt.status_snapshot != 'submit_failed':
+            from pcs.services import prodtask_record_submission_failure
+            prodtask_record_submission_failure(
+                task=task, panda_tasks_id=attempt.pk,
+                reason=f'submit-evgen-task.py exit {rc}; see {log}')
+            outcome = f'failed, exit {rc} (recorded on the attempt here)'
     return {'outcome': outcome, 'exit': rc, 'jedi_task_id': jedi,
             'panda_task_name': attempt.task_name, 'panda_tasks_id': attempt.pk,
             'log': str(log)}
@@ -460,6 +477,63 @@ def submit_existing(args):
     return 0 if result.get('exit') == 0 else 1
 
 
+def pending_attempts(task, tries=(), min_age_minutes=30):
+    """The clone's attempts that show pending and never reached PanDA: no
+    jediTaskID and no recorded failure. Each is returned with why it is or
+    is not to be marked failed. ``tries`` limits them to those try numbers;
+    an attempt younger than ``min_age_minutes`` is left alone, as a
+    submission may still be running; one whose name PanDA holds is left
+    alone, as it reached PanDA and wants its jediTaskID recorded instead."""
+    from django.utils import timezone
+    from pcs.services import ServiceError, _panda_task_name_exists
+    rows = []
+    now = timezone.now()
+    for row in task.panda_tasks.order_by('try_number'):
+        if row.jedi_task_id is not None or row.status_snapshot:
+            continue
+        if tries and row.try_number not in tries:
+            continue
+        age = (now - row.created_at).total_seconds() / 60
+        entry = {'panda_tasks_id': row.pk, 'try': row.try_number, 'name': row.task_name,
+                 'created_at': row.created_at, 'age_minutes': round(age)}
+        if age < min_age_minutes:
+            entry['skip'] = f'younger than {min_age_minutes} minutes: may still be submitting'
+        else:
+            try:
+                if _panda_task_name_exists(row.task_name):
+                    entry['skip'] = ('PanDA holds this name: it reached PanDA; record its '
+                                     'jediTaskID instead')
+            except ServiceError as e:
+                cause = f' ({e.__cause__})' if e.__cause__ is not None else ''
+                entry['skip'] = f'{e}{cause}: run with --production-env'
+        rows.append(entry)
+    return rows
+
+
+def fail_pending(args):
+    """--fail-pending: mark a clone's stuck attempts submit_failed. A plan
+    unless --apply."""
+    from pcs.services import prodtask_record_submission_failure
+    task = clone_of(args.source)
+    rows = pending_attempts(task, tries=set(args.fail_pending),
+                            min_age_minutes=args.min_age)
+    for entry in rows:
+        if 'skip' in entry:
+            continue
+        if args.apply:
+            prodtask_record_submission_failure(
+                task=task, panda_tasks_id=entry['panda_tasks_id'],
+                reason=f'marked failed by {args.by} (clone-es-task.py --fail-pending): '
+                       f'{args.reason}; it never reached PanDA')
+            entry['marked'] = 'submit_failed'
+        else:
+            entry['marked'] = 'would mark submit_failed (--apply to write)'
+    print(json.dumps({'task': task.composed_name, 'attempts': rows}, indent=2, default=str))
+    if not args.apply:
+        print('plan only: --apply marks the attempts', file=sys.stderr)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument('source', help='composed name of the task whose configuration is cloned')
@@ -495,6 +569,13 @@ def main():
                              'or the production-ops account\'s')
     ap.add_argument('--submit-timeout', type=int, default=360,
                     help='seconds the direct doer may take (default 360)')
+    ap.add_argument('--fail-pending', nargs='*', type=int, default=None, metavar='TRY',
+                    help="mark the clone's attempts that show pending and never reached PanDA "
+                         'as submit_failed (all of them, or these try numbers; base is 1); '
+                         'a plan unless --apply')
+    ap.add_argument('--min-age', type=int, default=30, metavar='MINUTES',
+                    help='with --fail-pending: leave attempts younger than this alone '
+                         '(default 30)')
     ap.add_argument('--restore', action='store_true',
                     help="put back the Event Service setup of a clone that lost it (Unplace)")
     ap.add_argument('--production-env', action='store_true',
@@ -506,6 +587,10 @@ def main():
     args = ap.parse_args()
     for path, keys in LOADED_ENV:
         print(f'env: {path}: {len(keys)} keys', file=sys.stderr)
+    if args.fail_pending is not None:
+        if args.restore or args.submit or args.submit_direct:
+            ap.error('--fail-pending stands alone (with --apply to write)')
+        return fail_pending(args)
     if args.restore:
         if args.apply or args.submit:
             ap.error('--restore acts on an existing clone: no --apply or --submit')
