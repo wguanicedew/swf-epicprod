@@ -40,13 +40,29 @@ refuses unless --ignore-placement names the override. With --apply it submits
 the new clone; without --apply SOURCE must be an unsubmitted clone made
 earlier by this script, which is then submitted as it stands.
 
+--restore puts back the Event Service setup of a clone that lost it: an
+Unplace of a task not yet in PanDA drops ``overrides['event_service']``
+(pcs/services.py prodtask_unplace), and no whole-node queue rebuilds a
+particle-gun shape. The setup is the one recorded on the clone at --apply;
+a clone made before that record is rebuilt from its --es-from task with the
+--events-per-job, --set and --unset given now (the --apply ones: they were
+not recorded), and refused unless its seed stem matches the recorded one, so
+it names the generation plan already registered. --site places it again;
+--submit-direct then submits it.
+
 Run in the monitor Django environment with the testbed venv and ~/.env, as
-the production-ops user (the plan upload needs the service proxy):
+the production-ops user (the plan upload needs the service proxy).
+--production-env and --env-file PATH load KEY=VALUE files into this process
+before Django starts (production.env cannot be sourced: its values carry shell
+metacharacters); --submit-direct's attempt-name lookup needs the PANDA_DB_*
+settings production.env holds. Values are never printed, only key counts.
 
     clone-es-task.py <source> --by wguan --reason TEXT [--site BNL_OSG_PanDA_1] \\
         [--es-from <ES task>] [--events N] [--set slots=1] \\
         [--apply [--submit | --submit-direct [--ignore-placement]]]
     clone-es-task.py <clone> --by wguan --reason TEXT --submit-direct
+    clone-es-task.py <clone> --by wguan --reason TEXT --restore [--events-per-job N] \\
+        [--site QUEUE] [--submit-direct [--ignore-placement]]
 """
 import argparse
 import datetime
@@ -56,6 +72,48 @@ import subprocess
 import sys
 from pathlib import Path
 
+PRODUCTION_ENV = Path('/opt/swf-monitor/config/env/production.env')
+
+
+def key_values(path):
+    """A KEY=VALUE env file read as data, never sourced (submit-es-canary.py):
+    production.env's values carry shell metacharacters."""
+    values = {}
+    for raw in Path(path).read_text().splitlines():
+        raw = raw.strip().removeprefix('export ')
+        if raw and not raw.startswith('#') and '=' in raw:
+            key, value = raw.split('=', 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def env_files(argv):
+    """The --production-env / --env-file files, in the order given; read
+    before Django starts, as its settings (the PanDA DB among them) come
+    from the environment."""
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--production-env', action='store_true')
+    pre.add_argument('--env-file', action='append', default=[])
+    known, _ = pre.parse_known_args(argv)
+    return ([PRODUCTION_ENV] if known.production_env else []) + \
+        [Path(p).expanduser() for p in known.env_file]
+
+
+def load_env(files):
+    """Each file's keys into this process's environment; a later file wins
+    over an earlier one, and both over the shell's. Returns the keys set."""
+    loaded = []
+    for path in files:
+        try:
+            values = key_values(path)
+        except OSError as e:
+            raise SystemExit(f'--env-file {path}: {e.strerror}')
+        os.environ.update(values)
+        loaded.append((str(path), sorted(values)))
+    return loaded
+
+
+LOADED_ENV = load_env(env_files(sys.argv[1:]))
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'swf_monitor_project.settings')
 
 import django  # noqa: E402
@@ -89,7 +147,6 @@ SPEC_KEYS = ('taskName', 'containerImage', 'inputDataset', 'nEventsPerJob', 'nJo
 
 # The deployed monitor whose credentialed doer submits (submit-es-canary.py).
 DEPLOYED = Path('/opt/swf-monitor/current')
-PRODUCTION_ENV = Path('/opt/swf-monitor/config/env/production.env')
 # The internal face: the external one refuses the record write.
 MONITOR_URL = 'https://pandaserver02.sdcc.bnl.gov/swf-monitor'
 DIRECT_SOURCE = 'clone_es_task_direct'
@@ -178,17 +235,6 @@ def identify(es, config, path, sample, stem):
     return definition(es)  # refuses a malformed shape before anything is written
 
 
-def key_values(path):
-    """A KEY=VALUE env file read as data, never sourced (submit-es-canary.py)."""
-    values = {}
-    for raw in Path(path).read_text().splitlines():
-        raw = raw.strip().removeprefix('export ')
-        if raw and not raw.startswith('#') and '=' in raw:
-            key, value = raw.split('=', 1)
-            values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
-
-
 def doer_environment(owner):
     """The deployed doer's environment: production.env, the operator's DRF
     token for the record write, the internal monitor URL."""
@@ -258,7 +304,10 @@ def submit_direct(task, *, by, reason, ignore_placement=False, timeout=360, log=
     try:
         attempt = prepare_direct(task, by=by, reason=reason, ignore_placement=ignore_placement)
     except ServiceError as e:
-        return {'outcome': 'refused', 'reason': str(e)}
+        reason = str(e)
+        if e.__cause__ is not None:  # e.g. the PanDA name lookup's own error
+            reason += f' ({type(e.__cause__).__name__}: {e.__cause__})'
+        return {'outcome': 'refused', 'reason': reason}
     stamp = datetime.datetime.now().strftime('%Y%m%dT%H%M%S')
     log = log or LOG_DIR / f'{task.composed_name}.{stamp}.log'
     owner = task.created_by or by
@@ -276,12 +325,74 @@ def submit_direct(task, *, by, reason, ignore_placement=False, timeout=360, log=
             'log': str(log)}
 
 
-def submit_existing(args):
-    """--submit-direct without --apply: submit a clone this script made."""
-    task = ProdTask.objects.get(name=args.source)
+def clone_of(name):
+    """A task this script made, or SystemExit."""
+    task = ProdTask.objects.get(name=name)
     if MARKER not in (task.overrides or {}):
         raise SystemExit(f'{task.composed_name} was not made by clone-es-task.py; '
-                         'clone it with --apply --submit-direct')
+                         'clone it with --apply')
+    return task
+
+
+def restored_setup(task, args):
+    """The clone's Event Service setup as --apply made it."""
+    entry = task.overrides[MARKER]
+    if entry.get('event_service'):
+        return dict(entry['event_service'])
+    # A clone made before the setup was recorded: rebuilt, then checked
+    # against the seed stem its registered plan was made from.
+    es_source = ProdTask.objects.get(name=entry['es_from'])
+    config = configuration_of(task)
+    args.events = int(entry['events'])
+    es = es_shape(es_source, args)
+    path, original_stem = internal_evgen_sample(config)
+    stem = original_stem + '.' + entry['sample']
+    if stem != entry['seed_stem']:
+        raise SystemExit(f'rebuilt seed stem {stem} is not the recorded {entry["seed_stem"]}')
+    return identify(es, config, path, entry['sample'], stem)
+
+
+def restore(args):
+    """--restore: put back a clone's Event Service setup, place it, submit it."""
+    from pcs.services import ServiceError, prodtask_place
+    task = clone_of(args.source)
+    result = {'task': task.composed_name}
+    if (task.overrides or {}).get('event_service'):
+        result['restored'] = 'already carries its Event Service setup'
+    else:
+        if task.panda_task_id is not None:
+            raise SystemExit(f'{task.composed_name} is in PanDA as {task.panda_task_id}: '
+                             'its jobs already have their shape')
+        es = restored_setup(task, args)
+        with transaction.atomic():
+            locked = ProdTask.objects.select_for_update().get(pk=task.pk)
+            overrides = dict(locked.overrides or {}, event_service=es)
+            overrides[MARKER] = dict(overrides[MARKER], event_service=es)
+            locked.overrides = overrides
+            locked.save(update_fields=['overrides', 'updated_at'])
+        task.refresh_from_db()
+        result['restored'] = es
+    if args.site:
+        try:
+            prodtask_place(task, args.site, changed_by=args.by,
+                           placement={'reason': args.reason})
+            task.refresh_from_db()
+        except ServiceError as e:
+            raise SystemExit(f'placing on {args.site}: {e.detail}')
+    site = (task.overrides or {}).get('panda_site') or ''
+    verdict = event_service_misplaced(site, task) if site else 'placed on no queue'
+    result.update(site=site or None, submission_verdict=verdict or 'accepted')
+    if args.submit_direct:
+        result['submitted'] = submit_direct(task, by=args.by, reason=args.reason,
+                                            ignore_placement=args.ignore_placement,
+                                            timeout=args.submit_timeout)
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if not args.submit_direct or result['submitted'].get('exit') == 0 else 1
+
+
+def submit_existing(args):
+    """--submit-direct without --apply: submit a clone this script made."""
+    task = clone_of(args.source)
     result = submit_direct(task, by=args.by, reason=args.reason,
                            ignore_placement=args.ignore_placement, timeout=args.submit_timeout)
     print(json.dumps({'task': task.composed_name, 'site': (task.overrides or {}).get('panda_site'),
@@ -295,7 +406,9 @@ def main():
     ap.add_argument('--by', required=True, help='operator creating the task (records carry it)')
     ap.add_argument('--reason', required=True,
                     help='why, and whose approval: recorded as the authorization')
-    ap.add_argument('--site', default='BNL_OSG_PanDA_1')
+    ap.add_argument('--site', default='',
+                    help='queue to place on (default BNL_OSG_PanDA_1 for a new clone; '
+                         'with --restore, left as it is)')
     ap.add_argument('--es-from', default='', help='task whose ES shape is cloned (default: source)')
     ap.add_argument('--prefix', default='cES', help='sample name prefix (default cES)')
     ap.add_argument('--sample', default='', help='explicit sample name (default: next free)')
@@ -318,7 +431,24 @@ def main():
                          'verdict (recorded on the attempt)')
     ap.add_argument('--submit-timeout', type=int, default=360,
                     help='seconds the direct doer may take (default 360)')
+    ap.add_argument('--restore', action='store_true',
+                    help="put back the Event Service setup of a clone that lost it (Unplace)")
+    ap.add_argument('--production-env', action='store_true',
+                    help=f'load {PRODUCTION_ENV} (read as KEY=VALUE data) before Django '
+                         'starts: the PanDA DB settings the attempt-name lookup needs')
+    ap.add_argument('--env-file', action='append', default=[], metavar='PATH',
+                    help='load another KEY=VALUE file, e.g. ~/.env (repeatable; '
+                         'applied after --production-env, a later file wins)')
     args = ap.parse_args()
+    for path, keys in LOADED_ENV:
+        print(f'env: {path}: {len(keys)} keys', file=sys.stderr)
+    if args.restore:
+        if args.apply or args.submit:
+            ap.error('--restore acts on an existing clone: no --apply or --submit')
+        if args.ignore_placement and not args.submit_direct:
+            ap.error('--ignore-placement is for --submit-direct')
+        return restore(args)
+    args.site = args.site or 'BNL_OSG_PanDA_1'
     if args.submit and not args.apply:
         ap.error('--submit needs --apply')
     if args.submit and args.submit_direct:
@@ -376,7 +506,9 @@ def main():
         task.overrides[MARKER] = {'authority': args.reason, 'by': args.by, 'sample': sample,
                                   'events': es['events'], 'seed_stem': stem,
                                   'source': source.composed_name,
-                                  'es_from': es_source.composed_name}
+                                  'es_from': es_source.composed_name,
+                                  # what --restore puts back after an Unplace
+                                  'event_service': es}
         fields = ['overrides']
         if prod_config is not None and task.prod_config_id != prod_config.pk:
             task.prod_config = prod_config
